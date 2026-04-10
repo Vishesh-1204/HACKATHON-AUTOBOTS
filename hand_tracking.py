@@ -8,15 +8,8 @@ Public API
 ----------
 process_frame(frame)         → raw MediaPipe results
 get_all_hands_data(results)  → list of hand dicts (see below)
-get_smoothed_landmarks(landmarks, hand_type, w, h)  → np.ndarray (21,2)
+smooth_normalized_landmarks(landmarks, hand_type)  → smooth 3D landmarks
 reset_smoothing(hand_type=None)  → clear one or all buffers
-
-Hand dict schema
-----------------
-{
-    "type":      "Left" | "Right",   # MediaPipe handedness
-    "landmarks": <list of 21 NormalizedLandmark>
-}
 """
 
 import cv2
@@ -29,6 +22,13 @@ from mediapipe.tasks.python import vision
 
 NUM_LANDMARKS = 21
 
+class SmoothLandmark:
+    """Wrapper to mimic MediaPipe's NormalizedLandmark with smooth mutable states."""
+    __slots__ = ['x', 'y', 'z']
+    def __init__(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
 
 class HandTracker:
     """
@@ -39,14 +39,7 @@ class HandTracker:
     def __init__(self,
                  model_path='hand_landmarker.task',
                  max_hands=2,
-                 smoothing_factor=0.45):
-        """
-        Args:
-            model_path:       Path to the .task model file.
-            max_hands:        Maximum number of hands to detect (default 2).
-            smoothing_factor: EMA alpha — 0 = very smooth/laggy,
-                              1 = no smoothing/jittery. 0.45 is a good default.
-        """
+                 smoothing_factor=0.6): # 0.6 for responsive but stable performance
         self.model_path       = model_path
         self.max_hands        = max_hands
         self.smoothing_factor = smoothing_factor
@@ -56,26 +49,20 @@ class HandTracker:
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
             num_hands=max_hands,
-            min_hand_detection_confidence=0.7,
-            min_hand_presence_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_hand_detection_confidence=0.5, # Lowered for fewer lost frames
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
             running_mode=vision.RunningMode.IMAGE
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
 
-        # Independent EMA buffers keyed by hand type: "Left" / "Right"
-        # Shape of each value: np.ndarray (NUM_LANDMARKS, 2) float64
-        self._smoothed_px: dict[str, np.ndarray | None] = {
+        # Independent EMA buffers keyed by hand type
+        self._smoothed_norm: dict[str, np.ndarray | None] = {
             "Left":  None,
             "Right": None,
         }
 
-    # ──────────────────────────────────────────────────────────────────
-    # Model management
-    # ──────────────────────────────────────────────────────────────────
-
     def _ensure_model_exists(self):
-        """Downloads the MediaPipe hand landmarker model if missing."""
         if not os.path.exists(self.model_path):
             print("Downloading hand_landmarker model…")
             urllib.request.urlretrieve(
@@ -84,46 +71,19 @@ class HandTracker:
                 self.model_path
             )
 
-    # ──────────────────────────────────────────────────────────────────
-    # Detection
-    # ──────────────────────────────────────────────────────────────────
-
     def process_frame(self, frame):
-        """Run MediaPipe detection on a BGR OpenCV frame. Returns raw results."""
+        """Run MediaPipe detection on a BGR OpenCV frame."""
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
         return self.detector.detect(mp_image)
 
     def get_all_hands_data(self, results, frame_is_flipped=True):
-        """
-        Extract data for ALL detected hands.  Each entry in the returned
-        list is independent — Left and Right are never merged or overwritten.
-
-        Args:
-            results:          MediaPipe HandLandmarker results.
-            frame_is_flipped: Boolean indicating if the input frame was horizontally
-                              flipped. If True, reverses MediaPipe's handedness labels
-                              to match the user's real physical hands.
-
-        Returns:
-            List of dicts, one per detected hand:
-            [
-              { "type": "Left",  "landmarks": <21-lm list> },
-              { "type": "Right", "landmarks": <21-lm list> },
-              ...
-            ]
-            Returns an empty list when no hands are detected.
-        """
         hands_data = []
         if not (results and results.hand_landmarks):
             return hands_data
 
         for i, lm_list in enumerate(results.hand_landmarks):
             hand_type = results.handedness[i][0].category_name
-            
-            # MediaPipe predicts handedness based on visual appearance.
-            # If the user mirrors the camera feed for natural interaction,
-            # a real Left hand looks like a Right hand to the model.
             if frame_is_flipped:
                 hand_type = "Right" if hand_type == "Left" else "Left"
 
@@ -131,63 +91,24 @@ class HandTracker:
                 "type":      hand_type,
                 "landmarks": lm_list,
             })
-
         return hands_data
 
-    # ──────────────────────────────────────────────────────────────────
-    # Per-hand smoothed pixel coordinates
-    # ──────────────────────────────────────────────────────────────────
-
-    def get_smoothed_landmarks(self, landmarks, hand_type, width, height):
-        """
-        Convert normalised landmarks to pixel coordinates and apply
-        per-hand EMA smoothing so the two hands never interfere.
-
-        Args:
-            landmarks:  List of 21 NormalizedLandmark objects.
-            hand_type:  "Left" or "Right" — selects the correct buffer.
-            width:      Frame pixel width.
-            height:     Frame pixel height.
-
-        Returns:
-            np.ndarray of shape (21, 2) — smoothed int32 pixel (x, y).
-        """
-        raw = np.array(
-            [[lm.x * width, lm.y * height] for lm in landmarks],
-            dtype=np.float64
-        )
-
-        buf = self._smoothed_px.get(hand_type)
+    def smooth_normalized_landmarks(self, landmarks, hand_type):
+        """Applies EMA smoothing directly to the 3D normalized coordinates to fix structural jitter."""
+        raw = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float64)
+        buf = self._smoothed_norm.get(hand_type)
+        
         if buf is None:
-            self._smoothed_px[hand_type] = raw.copy()
+            buf = raw.copy()
         else:
-            a = self.smoothing_factor
-            self._smoothed_px[hand_type] = a * raw + (1 - a) * buf
-
-        return self._smoothed_px[hand_type].astype(np.int32)
+            alpha = self.smoothing_factor
+            buf = alpha * raw + (1.0 - alpha) * buf
+            
+        self._smoothed_norm[hand_type] = buf
+        return [SmoothLandmark(float(r[0]), float(r[1]), float(r[2])) for r in buf]
 
     def reset_smoothing(self, hand_type=None):
-        """
-        Reset the EMA smoothing buffer.
-
-        Args:
-            hand_type: "Left", "Right", or None (resets both).
-        """
         if hand_type is None:
-            self._smoothed_px = {"Left": None, "Right": None}
-        elif hand_type in self._smoothed_px:
-            self._smoothed_px[hand_type] = None
-
-    # ──────────────────────────────────────────────────────────────────
-    # Backward-compatible single-hand helper (kept for legacy callers)
-    # ──────────────────────────────────────────────────────────────────
-
-    def get_first_hand_data(self, results):
-        """
-        Returns (landmarks, handedness_str) for the first detected hand
-        only.  Prefer get_all_hands_data() for multi-hand use.
-        """
-        data = self.get_all_hands_data(results)
-        if data:
-            return data[0]["landmarks"], data[0]["type"]
-        return None, None
+            self._smoothed_norm = {"Left": None, "Right": None}
+        elif hand_type in self._smoothed_norm:
+            self._smoothed_norm[hand_type] = None

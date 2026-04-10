@@ -1,9 +1,10 @@
 """
 gesture_recognition.py — Agent 2: Gesture Recognition Engineer
 ==============================================================
-Robust per-finger state detection using structural landmark comparisons
-(tip vs PIP for fingers, lateral X for thumb) and temporal smoothing
-for flicker-free gesture output.
+Robust multi-condition gesture classifier operating on MediaPipe 3D geometries.
+Eliminates naive binary flickers by computing continuous confidence thresholds
+based on finger states, anatomical joint comparisons, and rotational-invariant
+vector distances (compactness / pinch radii).
 """
 
 import math
@@ -11,128 +12,154 @@ from collections import deque
 
 
 class GestureRecognizer:
-    """Detects individual finger states and classifies hand gestures."""
+    """Detects individual finger states and classifies hand gestures via Confidence Scoring."""
 
     def __init__(self, history_length=5):
         """
         Args:
-            history_length: Number of past frames to consider for temporal
-                            majority-vote smoothing of the gesture label and states.
+            history_length: Length of temporal history buffer to stabilize gesture outputs.
         """
         self._history = deque(maxlen=history_length)
         self._state_history = deque(maxlen=history_length)
 
     # ------------------------------------------------------------------
-    # Per-finger detection
+    # Per-finger detection (Robust Euclidean Distance logic)
     # ------------------------------------------------------------------
     def is_finger_up(self, landmarks, finger_id, handedness):
         """
-        Returns 1 if the given finger is extended and 0 otherwise.
-
-        Uses anatomically meaningful comparisons:
-        - Thumb:  lateral X displacement of TIP (4) vs IP (3),
-                  adjusted for left/right hand.
-        - Others: vertical Y of TIP vs PIP joint. A tip that is
-                  higher than its PIP means the finger is extended.
-
-        finger_id: 0=Thumb, 1=Index, 2=Middle, 3=Ring, 4=Pinky
+        Calculates strict mechanical openness using spatial rotation-invariant distances.
+        Eliminates perspective flipping errors by assessing radius from Wrist instead of local Y heights.
         """
+        wrist = landmarks[0]
+        
         if finger_id == 0:
-            # Thumb: Use X-axis comparison depending on hand orientation.
-            # Detect orientation using wrist (0) and index MCP (5).
-            # If the index MCP (5) x is less than wrist (0) x, the hand is facing leftwards 
-            # (which means the thumb should be on the left/lower x).
-            # We determine the direction the thumb should point based on this palm orientation.
-            is_right_oriented = landmarks[5].x < landmarks[0].x
+            # Thumb: Open means resting outwardly opposed to the Pinky base.
+            # Closed means folded directly over the palm.
+            tip = landmarks[4]
+            ip = landmarks[3]
+            pinky_mcp = landmarks[17]
             
-            if is_right_oriented:
-                return 1 if landmarks[4].x < landmarks[3].x else 0
-            else:
-                return 1 if landmarks[4].x > landmarks[3].x else 0
+            dist_tip = math.hypot(tip.x - pinky_mcp.x, tip.y - pinky_mcp.y)
+            dist_ip  = math.hypot(ip.x - pinky_mcp.x, ip.y - pinky_mcp.y)
+            
+            return 1 if dist_tip > dist_ip else 0
         else:
+            # Fingers: Compare absolute 3D tip extension vs PIP joint radius from the wrist. 
             tip_ids = [8, 12, 16, 20]
             pip_ids = [6, 10, 14, 18]
-            tip = tip_ids[finger_id - 1]
-            pip = pip_ids[finger_id - 1]
-            # In screen space, lower Y = higher position
-            return 1 if landmarks[tip].y < landmarks[pip].y else 0
+            
+            tip = landmarks[tip_ids[finger_id - 1]]
+            pip = landmarks[pip_ids[finger_id - 1]]
+            
+            dist_tip = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
+            dist_pip = math.hypot(pip.x - wrist.x, pip.y - wrist.y)
+            
+            return 1 if dist_tip > dist_pip else 0
 
     def get_finger_states(self, landmarks, handedness):
         """
-        Returns [thumb, index, middle, ring, pinky] as a list of 0/1.
-        Includes temporal smoothing (majority voting) to prevent flickering.
+        Computes boolean finger extensions through a temporal majority voting buffer.
         """
         raw_states = [self.is_finger_up(landmarks, i, handedness) for i in range(5)]
         self._state_history.append(raw_states)
         
         smoothed_states = []
         for i in range(5):
-            # Majority vote count for this specific finger across history
             vote_count = sum(state_array[i] for state_array in self._state_history)
             smoothed_states.append(1 if vote_count > len(self._state_history) / 2 else 0)
             
         return smoothed_states
 
     # ------------------------------------------------------------------
-    # Gesture classification
+    # Confidence-based Gesture Architecture
     # ------------------------------------------------------------------
     def recognize_gesture(self, landmarks, handedness):
         """
-        Classifies the current hand pose into a named gesture using
-        finger states + normalised distance checks (for pinch).
-
-        Returns:
-            (gesture_name: str, finger_states: list[int])
+        Core physics engine computing anatomical vector shapes to prevent overlapping 
+        classification logic (e.g. Fists accidentally triggering Pinch).
         """
         states = self.get_finger_states(landmarks, handedness)
 
-        # Palm-size normalised pinch distance
+        # Baseline Anatomical Indexing
         wrist = landmarks[0]
         mcp_index = landmarks[5]
+        
+        # Scaling magnitude (distance across palm base) to normalize hand-to-camera distance 
         palm_size = math.hypot(mcp_index.x - wrist.x, mcp_index.y - wrist.y)
+        if palm_size < 1e-6: palm_size = 1e-6
 
+        # Key Effector Coordinates
         thumb_tip = landmarks[4]
         index_tip = landmarks[8]
-        pinch_dist = math.hypot(index_tip.x - thumb_tip.x,
-                                index_tip.y - thumb_tip.y)
+        middle_tip = landmarks[12]
+        ring_tip = landmarks[16]
+        pinky_tip = landmarks[20]
+        tips = [thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip]
 
-        # --- Classification rules (ordered by specificity) ---
+        # 1. PINCH MATH
+        pinch_dist = math.hypot(index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y)
+        pinch_ratio_raw = pinch_dist / palm_size
+        other_fingers_open = sum(states[2:]) # Evaluates Middle, Ring, Pinky
+        
+        # 2. OVERALL COMPACTNESS (FIST MATH)
+        avg_tip_dist = sum(math.hypot(t.x - wrist.x, t.y - wrist.y) for t in tips) / 5.0
+        compactness = avg_tip_dist / palm_size
+        closed_fingers_count = 5 - sum(states)
 
-        # 1. Pinch — thumb and index physically close regardless of state
-        if pinch_dist < palm_size * 0.8:
-            raw = "Grab (Pinch)"
+        # 3. COMPETITIVE CONFIDENCE MATRIX
+        confidences = {
+            "Stop (Fist)": 0.0,
+            "Grab (Pinch)": 0.0,
+            "Point": 0.0,
+            "Victory": 0.0,
+            "Move (Open)": 0.0
+        }
 
-        # 2. Fist — all fingers curled (thumb may flicker)
-        elif states[1:] == [0, 0, 0, 0]:
-            raw = "Stop (Fist)"
+        # --- FIST --- (Max compactness tightly curling)
+        fist_score = (closed_fingers_count / 5.0) + max(0.0, 1.5 - compactness)
+        # Validation override to aggressively clamp when mathematically curled
+        if closed_fingers_count >= 4 and compactness < 1.4:
+            fist_score += 2.0
+        confidences["Stop (Fist)"] = fist_score
 
-        # 3. Point — only index up
-        elif states[1] == 1 and sum(states[2:]) == 0:
-            raw = "Point"
+        # --- PINCH --- (Index & Thumb touching tightly, BUT hand itself remains un-curled)
+        pinch_score = max(0.0, 1.0 - pinch_ratio_raw) + (other_fingers_open / 3.0)
+        # Structural Validation: Demands external fingers be somewhat open to count positively
+        if pinch_ratio_raw < 0.8 and other_fingers_open >= 1:
+            pinch_score += 1.5
+        confidences["Grab (Pinch)"] = pinch_score
 
-        # 4. Victory — index + middle up, others down
-        elif states[1:3] == [1, 1] and sum(states[3:]) == 0:
-            raw = "Victory"
+        # --- POINT ---
+        if states[1] == 1 and sum(states[2:]) == 0:
+            confidences["Point"] = 2.0 + max(0.0, compactness - 1.0)
 
-        # 5. Open hand — at least 4 fingers up
-        elif sum(states) >= 4:
-            raw = "Move (Open)"
+        # --- VICTORY ---
+        if states[1:3] == [1, 1] and sum(states[3:]) == 0:
+            confidences["Victory"] = 2.0 + max(0.0, compactness - 1.0)
 
-        # 6. Fallback heuristic
-        else:
-            up_count = sum(states[1:])  # ignore thumb for fallback
-            if up_count >= 3:
-                raw = "Move (Open)"
-            elif up_count == 0:
-                raw = "Stop (Fist)"
-            else:
-                raw = "Move (Open)"
+        # --- OPEN HAND ---
+        open_score = (sum(states) / 5.0) + max(0.0, compactness - 1.5)
+        if sum(states) >= 4 and compactness > 1.8:
+            open_score += 1.5
+        confidences["Move (Open)"] = open_score
 
-        # --- Temporal majority-vote smoothing ---
-        self._history.append(raw)
+        # 4. GESTURE PRIORITY LOGIC (Explicit override resolution)
+        # A fully wrapped fist physically brings the thumb and index finger together.
+        # This violently wipes out the Pinch score if the whole hand is compressed down.
+        if confidences["Stop (Fist)"] > 1.8 and closed_fingers_count >= 4:
+            confidences["Grab (Pinch)"] *= 0.1
+
+        # Evaluate Victor
+        winner_raw = max(confidences.items(), key=lambda x: x[1])[0]
+
+        # Debug Readout Module (Optional Logging for fine-tuning weights)
+        # print(f"[{handedness}] States: {states} | PinchR: {pinch_ratio_raw:.2f} | C-Pact: {compactness:.2f} -> WINNER: {winner_raw}")
+
+        # 5. TEMPORAL STABILITY
+        self._history.append(winner_raw)
         counts = {}
         for g in self._history:
             counts[g] = counts.get(g, 0) + 1
-        smoothed = max(counts, key=counts.get)
+        smoothed_winner = max(counts, key=counts.get)
 
-        return smoothed, states
+        return smoothed_winner, states

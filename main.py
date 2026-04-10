@@ -36,8 +36,8 @@ def make_canvas(w, h):
 
 
 def main():
-    print("Using NEW visualization module")
-    print("RoboticArmVisualizer active  [DUAL-HAND MODE]")
+    print("Using NEW visualization module  [HIGH-PERFORMANCE MODE]")
+    print("RoboticArmVisualizer active     [DUAL-HAND MODE]")
 
     # ── Camera setup ────────────────────────────────────────────────
     cap = cv2.VideoCapture(0)
@@ -52,8 +52,7 @@ def main():
     canvas_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     # ── Module initialisation — one set per hand ──────────────────────
-    # HandTracker now detects up to 2 hands simultaneously
-    tracker = HandTracker(max_hands=2, smoothing_factor=0.45)
+    tracker = HandTracker(max_hands=2, smoothing_factor=0.6)
 
     # Independent gesture recognisers so Left and Right history never mix
     recognizers = {
@@ -61,23 +60,29 @@ def main():
         "Right": GestureRecognizer(history_length=5),
     }
 
-    # Independent arm visualisers — each keeps its own smoothed joint state
     arm_vis = {
         "Left":  RoboticArmVisualizer(),
         "Right": RoboticArmVisualizer(),
     }
 
-    # Persistent last-known state for each hand (shown in HUD when hand lost)
+    # Tracking & State Caches
     last_state = {
         "Left":  {"gesture": "No Hand", "fingers": [0, 0, 0, 0, 0]},
         "Right": {"gesture": "No Hand", "fingers": [0, 0, 0, 0, 0]},
     }
-    # Track which hands were detected this frame
-    detected_this_frame: set[str] = set()
+    last_valid_landmarks = {"Left": None, "Right": None}
+    no_hand_frames = {"Left": 0, "Right": 0}
 
+    # Temporal persistence config
+    LOST_HAND_THRESHOLD = 8
+    
     # ── FPS tracking ─────────────────────────────────────────────────
     prev_time = time.time()
     fps       = 0.0
+    frame_count = 0
+    
+    # Init first active canvas so frame-skipping has something to show
+    canvas = make_canvas(canvas_w, canvas_h)
 
     print(f"Canvas: {canvas_w}×{canvas_h} — press ESC to quit.")
 
@@ -86,74 +91,82 @@ def main():
         if not ok:
             continue
 
+        frame_count += 1
+
         # Mirror for natural selfie-view interaction
         frame = cv2.flip(frame, 1)
         h, w  = frame.shape[:2]
 
-        # ── Detect ALL hands ─────────────────────────────────────────
-        results    = tracker.process_frame(frame)
+        # ── Fast Tracker Downscaling ──
+        # MediaPipe is faster on smaller inputs, and coordinates remain normalized
+        small_frame = cv2.resize(frame, (640, 360))
+        results    = tracker.process_frame(small_frame)
         hands_data = tracker.get_all_hands_data(results)
-        # hands_data is a list of {"type": "Left"|"Right", "landmarks": ...}
 
         detected_this_frame = set()
 
+        # Update cache for successfully detected hands
         for hand in hands_data:
-            hand_type = hand["type"]          # "Left" or "Right"
-            landmarks = hand["landmarks"]     # 21 NormalizedLandmark objects
+            hand_type = hand["type"]
+            raw_landmarks = hand["landmarks"]
+            
+            # Smooth structural jitter at the 3D landmark level
+            smoothed = tracker.smooth_normalized_landmarks(raw_landmarks, hand_type)
+            last_valid_landmarks[hand_type] = smoothed
+            
             detected_this_frame.add(hand_type)
+            no_hand_frames[hand_type] = 0
 
-            # Per-hand gesture recognition (histories are separate)
-            gesture, finger_states = recognizers[hand_type].recognize_gesture(
-                landmarks, hand_type
-            )
-
-            # Feed landmarks + gesture into the correct arm visualiser
-            arm_vis[hand_type].update(landmarks, finger_states, gesture, w, h)
-
-            # Persist state for HUD
-            last_state[hand_type] = {
-                "gesture": gesture,
-                "fingers": finger_states,
-            }
-
-        # For hands NOT detected this frame — freeze arm and reset state
+        # Process logic for all hands
         for hand_type in ("Left", "Right"):
             if hand_type not in detected_this_frame:
-                tracker.reset_smoothing(hand_type)
-                arm_vis[hand_type].update(None, [0,0,0,0,0], "No Hand", w, h)
-                last_state[hand_type] = {
-                    "gesture": "No Hand",
-                    "fingers": [0, 0, 0, 0, 0],
-                }
+                no_hand_frames[hand_type] += 1
+                
+                # Grace period: reuse last valid landmarks to prevent 1-frame flickers
+                if no_hand_frames[hand_type] < LOST_HAND_THRESHOLD and last_valid_landmarks[hand_type]:
+                    smoothed_lms = last_valid_landmarks[hand_type]
+                    gesture, finger_states = recognizers[hand_type].recognize_gesture(smoothed_lms, hand_type)
+                    arm_vis[hand_type].update(smoothed_lms, finger_states, gesture, w, h, ARM_X_FRACTION[hand_type])
+                    last_state[hand_type] = {"gesture": gesture, "fingers": finger_states}
+                else:
+                    # Hand definitively lost -> trigger reset
+                    if no_hand_frames[hand_type] >= LOST_HAND_THRESHOLD:
+                        last_valid_landmarks[hand_type] = None
+                        tracker.reset_smoothing(hand_type)
+                        
+                        arm_vis[hand_type].update(None, [0,0,0,0,0], "Resetting...", w, h, ARM_X_FRACTION[hand_type])
+                        last_state[hand_type] = {"gesture": "Resetting...", "fingers": [0,0,0,0,0]}
+            else:
+                # Normal live update
+                smoothed_lms = last_valid_landmarks[hand_type]
+                gesture, finger_states = recognizers[hand_type].recognize_gesture(smoothed_lms, hand_type)
+                arm_vis[hand_type].update(smoothed_lms, finger_states, gesture, w, h, ARM_X_FRACTION[hand_type])
+                last_state[hand_type] = {"gesture": gesture, "fingers": finger_states}
 
-        # ── Build dark canvas — webcam feed is NEVER shown ─────────────
-        canvas = make_canvas(canvas_w, canvas_h)
+        # ── Rendering Loop (Skipped occasionally for FPS) ───────────
+        if frame_count % 2 == 0:
+            canvas = make_canvas(canvas_w, canvas_h)
+            
+            mid = canvas_w // 2
+            cv2.line(canvas, (mid, 0), (mid, canvas_h), (35, 35, 50), 1, cv2.LINE_AA)
 
-        # Draw a subtle vertical divider between the two arm zones
-        mid = canvas_w // 2
-        cv2.line(canvas, (mid, 0), (mid, canvas_h),
-                 (35, 35, 50), 1, cv2.LINE_AA)
+            for hand_type in ("Left", "Right"):
+                arm_vis[hand_type].render(
+                    canvas,
+                    x_fraction=ARM_X_FRACTION[hand_type],
+                    hand_label=ARM_LABEL[hand_type],
+                )
 
-        # Render each arm at its designated horizontal position
-        for hand_type in ("Left", "Right"):
-            arm_vis[hand_type].render(
-                canvas,
-                x_fraction=ARM_X_FRACTION[hand_type],
-                hand_label=ARM_LABEL[hand_type],
-            )
+            _draw_dual_hud(canvas, last_state, fps, canvas_w, canvas_h)
 
-        # ── FPS ───────────────────────────────────────────────────────
+        # ── FPS Tracking Math ─────────────────────────────────────────
         now = time.time()
         dt  = now - prev_time
         if dt > 0:
             fps = 0.8 * fps + 0.2 * (1.0 / dt)
         prev_time = now
 
-        # ── HUD — dual panels, one per arm ───────────────────────────
-        # Left-hand HUD: top-left corner (default)
-        _draw_dual_hud(canvas, last_state, fps, canvas_w, canvas_h)
-
-        # ── Display ───────────────────────────────────────────────────
+        # Always show the canvas window (fast)
         cv2.imshow("Robotic Arm Simulation  [Dual Hand]", canvas)
         if cv2.waitKey(1) & 0xFF == 27:
             break
@@ -174,6 +187,7 @@ GESTURE_BADGE_COLORS = {
     "Point":        (240, 200,  50),
     "Victory":      (220,  80, 240),
     "No Hand":      (80,   80,  80),
+    "Resetting...": (50,  150, 200),
 }
 FINGER_COLORS_LIST = [
     (80, 200, 255),   # Thumb  — amber
